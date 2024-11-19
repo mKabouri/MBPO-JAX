@@ -16,6 +16,7 @@ import functools
 from dm_control import suite
 from dm_control.rl.control import Environment
 from dm_control.viewer import application
+from stable_baselines3.sac import SAC
 from flax.training import train_state
 from typing import Tuple, Dict
 from dataclasses import dataclass
@@ -34,7 +35,8 @@ def make_env(
     )
 
 def aggregate_state(state):
-    return jnp.concatenate([state['orientations'], state['velocity']])
+    concat = jnp.array([jnp.concatenate([state['orientations'], state['velocity']])])
+    return concat
 
 def get_observation_dim(env):
     observation_spec = env.observation_spec()
@@ -58,6 +60,7 @@ class ReplayBufferConfigs:
     period: int
     min_length_time_axis: int
     max_length_time_axis: int
+    add_sequence_length: int
 
 @dataclass
 class DynamicsModelConfigs:
@@ -133,10 +136,10 @@ class ModelNetwork(nnx.Module):
         inputs: Tuple
     ) -> jax.Array:
         state, action = inputs
-        expand_state = jnp.expand_dims(state, axis=0)
+        # expand_state = jnp.expand_dims(state, axis=0)
         expand_action = jnp.expand_dims(action, axis=0)
 
-        output = jnp.concatenate([expand_state, expand_action], axis=-1)
+        output = jnp.concatenate([state, expand_action], axis=-1)
         output = nnx.relu(self.fc1(output))
         output = nnx.relu(self.fc2(output))
         output = nnx.relu(self.fc3(output))
@@ -146,14 +149,13 @@ class ModelNetwork(nnx.Module):
         log_sigma = self.fc_log_sigma(output)
         return mu, log_sigma
 
-    def sample(
-        self,
-        inputs: Tuple,
-        rng: jax.random.PRNGKey
-    ) -> jax.Array:
-        mu, log_sigma = self(inputs)
-        sigma = jnp.exp(log_sigma)
-        return mu + sigma*jax.random.normal(rng, mu.shape)
+def sample_transition(
+    mu: jax.Array,
+    log_sigma: jax.Array,
+    rng: jax.random.PRNGKey
+) -> jax.Array:
+    sigma = jnp.exp(log_sigma)
+    return mu + sigma*jax.random.normal(rng, mu.shape)
 
 class EnsembleModels(nnx.Module):
     def __init__(
@@ -163,9 +165,11 @@ class EnsembleModels(nnx.Module):
     ) -> None:
         super(EnsembleModels, self).__init__()
         self.configs = configs
-        self.models = np.array([
-            ModelNetwork(configs, rngs) for _ in range(configs.num_models)
-        ])
+        self.model1 = ModelNetwork(configs, rngs)
+        self.model2 = ModelNetwork(configs, rngs)
+        self.model3 = ModelNetwork(configs, rngs)
+        self.model4 = ModelNetwork(configs, rngs)
+        self.model5 = ModelNetwork(configs, rngs)
 
     @property
     def get_models(self):
@@ -182,8 +186,12 @@ class EnsembleModels(nnx.Module):
         # outputs = self._vmap_apply_model(self.models, jnp.array([state, action]))
         # print(f"{outputs = }")
         outputs = []
-        for model in self.models:
-            outputs.append(model(inputs))
+        outputs.append(self.model1(inputs))
+        outputs.append(self.model2(inputs))
+        outputs.append(self.model3(inputs))
+        outputs.append(self.model4(inputs))
+        outputs.append(self.model5(inputs))
+        assert len(outputs) == self.configs.num_models
         return outputs
 
 def gaussian_nll(
@@ -232,7 +240,7 @@ def train_step(
     """
     Train for a single step.
     """
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
+    grad_fn = nnx.value_and_grad(loss_fn)
     (loss, logits), grads = grad_fn(model, batch)
     metrics.update(loss=loss, logits=logits, labels=batch['label'])
     optimizer.update(grads)
@@ -255,13 +263,13 @@ class NetworkPolicy(nnx.Module):
             in_features=configs.hidden_dim,
             out_features=configs.hidden_dim,
             kernel_init=nnx.initializers.glorot_uniform(),
-            rngs=rng
+            rngs=rngs
         )
         self.fc3 = nnx.Linear(
             in_features=configs.hidden_dim,
             out_features=configs.action_dim,
             kernel_init=nnx.initializers.glorot_uniform(),
-            rngs=rng
+            rngs=rngs
         )
 
     @property
@@ -282,13 +290,13 @@ class NetworkPolicy(nnx.Module):
         input: jax.Array,
         key
     ):
-        key, subkey = jax.random.split(jax.random.PRNGKey(key))
+        key, subkey = jax.random.split(key)
         return key, jax.random.categorical(subkey, self(input))
 
-def first_fill_env_replay_buffer(replay_buffer, env: Environment):
+def first_fill_env_replay_buffer(replay_buffer, rb_env_state, env: Environment):
     time_step = env.reset()
     action_spec = env.action_spec()
-    while not replay_buffer.can_sample():
+    while not replay_buffer.can_sample(rb_env_state):
         action = np.random.uniform(
             action_spec.minimum, action_spec.maximum, size=action_spec.shape
         )
@@ -318,6 +326,10 @@ class MBPOAgent:
     ):
         """
         """
+        self.shared_key = jax.random.PRNGKey(0)
+        self.env = env
+        action_spec = env.action_spec()
+
         # D_env
         self.replay_buffer_env = fbx.make_trajectory_buffer(
             add_batch_size=replay_buffer_configs.add_batch_size,
@@ -327,14 +339,25 @@ class MBPOAgent:
             min_length_time_axis=replay_buffer_configs.min_length_time_axis,
             max_length_time_axis=replay_buffer_configs.max_length_time_axis,
         )
+        self.shared_key, subkey = jax.random.split(self.shared_key)
+        subkeys = jax.random.split(subkey, 2)
         dummy_data = {
-            "state": jnp.array([1, 1, 1, 1, 0., 0.]),
-            "action": jnp.array([0]),
-            "reward": jnp.array([1]),
-            "next_state": jnp.array([1, 1, 1, 1, 0., 0.])
+            "state": jax.random.normal(subkey, (1, get_observation_dim(env))),
+            "action": jax.random.uniform(subkeys[0], (1, action_spec.shape[0])),
+            "reward": jnp.array([1.]),
+            "next_state": jax.random.normal(subkeys[1], (1, get_observation_dim(env)))
         }
         self.rb_env_state = self.replay_buffer_env.init(dummy_data)
-        self.rb_env_state = first_fill_env_replay_buffer(self.replay_buffer_env, env)
+        broadcast_fn = lambda x: jnp.broadcast_to(
+            x,
+            (
+                replay_buffer_configs.add_batch_size,
+                replay_buffer_configs.add_sequence_length,
+                *x.shape
+            )
+        )
+        fake_batch_sequence = jax.tree.map(broadcast_fn, dummy_data)
+        self.rb_env_state = self.replay_buffer_env.add(self.rb_env_state, fake_batch_sequence)
 
         # D_model
         self.replay_buffer_model = fbx.make_trajectory_buffer(
@@ -353,28 +376,65 @@ class MBPOAgent:
         self.model_configs = dynamics_configs
         self.model = EnsembleModels(dynamics_configs, rngs)
 
-        self.optimizer_model = optax.adam(learning_rate=dynamics_configs.learning_rate)
-        self.optimizer_policy = optax.adam(learning_rate=policy_configs.learning_rate)
+        self.optimizer_policy = nnx.Optimizer(
+            self.policy,
+            optax.adam(learning_rate=policy_configs.learning_rate)
+        )
+        self.optimizer_model = nnx.Optimizer(
+            self.model,
+            optax.adam(learning_rate=dynamics_configs.learning_rate)
+        )
 
     def simulate(self, state, action):
         """
         """
-        pass
+        outputs = self.model((state, action))
+        self.shared_key, subkey = jax.random.split(self.shared_key)
+        rnd_model_idx = jax.random.randint(subkey, (1,), 0, self.model_configs.num_models)[0]
+        mu, log_sigma = outputs[rnd_model_idx]
 
-    def act(self, observation):
+        self.shared_key, subkey = jax.random.split(self.shared_key)
+        transition = sample_transition(mu, log_sigma, subkey)
+        next_state, reward = transition[:, :-1], transition[:, -1]
+        return next_state, reward
+
+    def act(self, state):
         """
         """
-        pass
+        self.shared_key, subkey = jax.random.split(self.shared_key)
+        _, action = self.policy.sample_action(state, subkey)
+        return action
 
     def update_model(self):
         """
         """
-        pass
+        sample_data = self.replay_buffer_env.sample()
+        loss = loss_fn(self.model, sample_data)
+        train_step(self.model, self.optimizer_model, loss)
 
     def update_policy(self):
         """
+        NEED SAC
         """
         pass
+        # # Sample data from the environment replay buffer
+        # samples = self.replay_buffer_env.sample(policy_configs.batch_size)
+        
+        # # Prepare the data for SAC training
+        # observations = samples["observations"]
+        # actions = samples["actions"]
+        # rewards = samples["rewards"]
+        # next_observations = samples["next_observations"]
+
+        # # Update the SAC agent
+        # self.sac_policy.replay_buffer.add(
+        #     obs=observations,
+        #     action=actions,
+        #     reward=rewards,
+        #     next_obs=next_observations,
+        # )
+        # self.sac_policy.learn(total_timesteps=policy_configs.gradient_steps)
+
 
     def train(self):
         """
@@ -390,7 +450,6 @@ class MBPOAgent:
         """
         """
         pass
-
 
 def mbpo_loop(
     agent: MBPOAgent,
@@ -432,14 +491,8 @@ if __name__ == "__main__":
 
     state = time_step.observation
     action_spec = env.action_spec()
-    print(f"{type(env) = }")
 
-    # Example action (assuming action space is [-1, 1])
-    action = np.random.uniform(
-        action_spec.minimum, action_spec.maximum, size=action_spec.shape
-    )
-
-    # Dynamics model configs
+    # Configs
     dynamics_configs = DynamicsModelConfigs(
         learning_rate=1e-3,
         num_models=5,
@@ -448,58 +501,34 @@ if __name__ == "__main__":
         action_dim=action_spec.shape[0],
         nb_model_rollouts=100
     )
-
-    # Initialize ensemble models
-    ensemble = EnsembleModels(dynamics_configs, nnx.Rngs(seed))
-    print(f"Ensemble models")
-
-    print(jnp.array(action))
-
-    batch = {
-        'state': aggregate_state(state),
-        'action': jnp.array(action),
-        'reward': jnp.array([env.task.get_reward(env.physics)]),
-        'next_state': aggregate_state(state),
-    }
-
-    print(f"{batch = }")
-    print(f"{batch['state'] = }")
-    print(f"{batch['action'] = }")
-    print(f"{batch['reward'] = }")
-    print(f"{batch['next_state'] = }")
-    print(f"batch created")
-
-    # Call the model and compute loss
-    outputs = ensemble((batch['state'], batch['action']))
-    print("Model outputs:", outputs)
-
-    # Compute loss
-    nll_loss = loss_fn(ensemble, batch)
-    print("Negative Log-Likelihood Loss:", nll_loss)
-
-    replay_buffer_configs = ReplayBufferConfigs(
+    policy_configs = PolicyConfigs(
+        learning_rate=1e-3,
+        hidden_dim=64,
+        state_dim=get_observation_dim(env),
+        action_dim=action_spec.shape[0],
+        nb_policy_updates=100
+    )
+    rb_configs = ReplayBufferConfigs(
         add_batch_size=1,
-        sample_batch_size=1,
+        sample_batch_size=4,
         sample_sequence_length=1,
         period=1,
-        min_length_time_axis=1
+        min_length_time_axis=16,
+        max_length_time_axis=32,
+        add_sequence_length=10
     )
 
-    replay_buffer = fbx.make_trajectory_buffer(
-        replay_buffer_configs
+    # MBPO agent
+    agent = MBPOAgent(
+        env,
+        dynamics_configs,
+        policy_configs,
+        rb_configs,
+        nnx.Rngs(seed)
     )
-    print(replay_buffer.buffer)
-    print()
-    print()
-    print()
-    replay_buffer.add_experience(
-        aggregate_state(state),
-        jnp.array([action]),
-        aggregate_state(state),
-        jnp.array([[env.task.get_reward(env.physics)]]),
-        False
-    )
-    print(replay_buffer.buffer)
+    state = aggregate_state(state)
+    rnd_action = agent.act(state)
+    agent.simulate(state, rnd_action)
 
 # if __name__ == "__main__":
 
