@@ -19,6 +19,7 @@ from typing import Tuple, Dict
 from dataclasses import dataclass
 
 # TODO: initialize configs with dataclasses
+# TODO: functions to jit!
 
 def make_env() -> gym.Env:
     """
@@ -115,10 +116,10 @@ class ModelNetwork(nnx.Module):
         inputs: Tuple
     ) -> jax.Array:
         state, action = inputs
-        # expand_state = jnp.expand_dims(state, axis=0)
-        expand_action = jnp.expand_dims(action, axis=0)
+        if len(action.shape) == 0:
+            action = jnp.expand_dims(action, axis=0)
 
-        output = jnp.concatenate([state, expand_action], axis=-1)
+        output = jnp.concatenate([state, action], axis=-1)
         output = nnx.relu(self.fc1(output))
         output = nnx.relu(self.fc2(output))
         output = nnx.relu(self.fc3(output))
@@ -181,10 +182,7 @@ def gaussian_nll(
     """
     Negative log-likelihood loss for a Gaussian distribution.
     """
-    print(f"{targets = }")
-    print(f"{mu = }")
     concat_targets = jnp.concatenate([targets[0], targets[1]], axis=1)
-    print(f"{concat_targets = }")
     sigma = jnp.exp(log_sigma)
     nll = 0.5*jnp.sum(jnp.square((concat_targets-mu)/sigma) + 2*log_sigma)
     return nll
@@ -196,17 +194,17 @@ def loss_fn(
     """
     Compute the loss function.
     """
-    state = batch['state']
-    action = batch['action']
+    state = jnp.squeeze(batch.experience['state'], axis=1)
+    action = jnp.squeeze(batch.experience['action'], axis=1)
     outputs = model((state, action))
-
     mus, log_sigmas = zip(*outputs)
 
     mus = jnp.stack(mus)
     log_sigmas = jnp.stack(log_sigmas)
 
-    nll = gaussian_nll(mus, log_sigmas, (batch['next_state'], batch['reward']))
-
+    next_state = jnp.squeeze(batch.experience['next_state'], axis=1)
+    reward = batch.experience['reward']
+    nll = gaussian_nll(mus, log_sigmas, (next_state, reward))
     return nll
 
 @nnx.jit
@@ -220,8 +218,7 @@ def train_step(
     Train for a single step.
     """
     grad_fn = nnx.value_and_grad(loss_fn)
-    (loss, logits), grads = grad_fn(model, batch)
-    metrics.update(loss=loss, logits=logits, labels=batch['label'])
+    loss, grads = grad_fn(model, batch)
     optimizer.update(grads)
 
 class NetworkPolicy(nnx.Module):
@@ -390,9 +387,10 @@ class MBPOAgent:
     def update_model(self):
         """
         """
-        sample_data = self.replay_buffer_env.sample()
+        self.shared_key, subkey = jax.random.split(self.shared_key)
+        sample_data = self.replay_buffer_env.sample(self.rb_env_state, subkey)
         loss = loss_fn(self.model, sample_data)
-        train_step(self.model, self.optimizer_model, loss)
+        train_step(self.model, self.optimizer_model, loss, sample_data)
 
     def update_policy(self):
         """
@@ -416,7 +414,6 @@ class MBPOAgent:
         #     next_obs=next_observations,
         # )
         # self.sac_policy.learn(total_timesteps=policy_configs.gradient_steps)
-
 
     def train(self):
         """
@@ -507,7 +504,8 @@ if __name__ == "__main__":
     )
     print(f"Agent initialized.")
     rnd_action = agent.act(obs)
-    out, out1 = agent.simulate(obs, rnd_action)
+    out, out1 = agent.simulate(jnp.array(obs), jnp.array(rnd_action))
+    agent.update_model()
 
     env.close()
 
