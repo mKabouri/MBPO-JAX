@@ -4,7 +4,7 @@ Reference:
 https://arxiv.org/abs/1906.08253
 """
 import numpy as np
-import dm_control
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import flax
@@ -13,9 +13,6 @@ import flashbax as fbx
 import optax
 import functools
 
-from dm_control import suite
-from dm_control.rl.control import Environment
-from dm_control.viewer import application
 from stable_baselines3.sac import SAC
 from flax.training import train_state
 from typing import Tuple, Dict
@@ -23,28 +20,10 @@ from dataclasses import dataclass
 
 # TODO: initialize configs with dataclasses
 
-def make_env(
-    rng: jax.random.PRNGKey
-) -> Environment:
+def make_env() -> gym.Env:
     """
     """
-    return suite.load(
-        domain_name="acrobot",
-        task_name="swingup",
-        task_kwargs={'random': rng}
-    )
-
-def aggregate_state(state):
-    concat = jnp.array([jnp.concatenate([state['orientations'], state['velocity']])])
-    return concat
-
-def get_observation_dim(env):
-    observation_spec = env.observation_spec()
-    total_dim = sum(
-        np.prod(spec.shape) for spec in observation_spec.values()
-    )
-    return total_dim
-
+    return gym.make("InvertedPendulum-v5", render_mode="human")
 
 @dataclass
 class MBPOGeneralHyperparameters:
@@ -293,32 +272,33 @@ class NetworkPolicy(nnx.Module):
         key, subkey = jax.random.split(key)
         return key, jax.random.categorical(subkey, self(input))
 
-def first_fill_env_replay_buffer(replay_buffer, rb_env_state, env: Environment):
-    time_step = env.reset()
-    action_spec = env.action_spec()
+def first_fill_env_replay_buffer(replay_buffer, rb_env_state, env: gym.Env):
+    obs, _ = env.reset()
+
     while not replay_buffer.can_sample(rb_env_state):
-        action = np.random.uniform(
-            action_spec.minimum, action_spec.maximum, size=action_spec.shape
-        )
-        next_time_step = env.step(action)
+        action = env.action_space.sample()
+        new_obs, reward, done, truncated, _ = env.step(action)
         data = {
-            "state": aggregate_state(time_step.observation),
+            "state": jnp.array(obs),
             "action": jnp.array(action),
-            "reward": jnp.array([env.task.get_reward(env.physics)]),
-            "next_state": aggregate_state(next_time_step.observation)
+            "reward": jnp.array(reward),
+            "next_state": jnp.array(new_obs)
         }
         rb_env_state = replay_buffer.add(
             rb_env_state,
             data
         )
-        time_step = next_time_step
-    time_step = env.reset()
+        if done or truncated:
+            obs, _ = env.reset()
+        else:
+            obs = new_obs
+    obs, _ = env.reset()
     return rb_env_state
 
 class MBPOAgent:
     def __init__(
         self,
-        env: Environment,
+        env: gym.Env,
         dynamics_configs: DynamicsModelConfigs,
         policy_configs: PolicyConfigs,
         replay_buffer_configs: ReplayBufferConfigs,
@@ -328,7 +308,6 @@ class MBPOAgent:
         """
         self.shared_key = jax.random.PRNGKey(0)
         self.env = env
-        action_spec = env.action_spec()
 
         # D_env
         self.replay_buffer_env = fbx.make_trajectory_buffer(
@@ -339,13 +318,11 @@ class MBPOAgent:
             min_length_time_axis=replay_buffer_configs.min_length_time_axis,
             max_length_time_axis=replay_buffer_configs.max_length_time_axis,
         )
-        self.shared_key, subkey = jax.random.split(self.shared_key)
-        subkeys = jax.random.split(subkey, 2)
         dummy_data = {
-            "state": jax.random.normal(subkey, (1, get_observation_dim(env))),
-            "action": jax.random.uniform(subkeys[0], (1, action_spec.shape[0])),
-            "reward": jnp.array([1.]),
-            "next_state": jax.random.normal(subkeys[1], (1, get_observation_dim(env)))
+            "state": jnp.array(env.observation_space.sample()),
+            "action": jnp.array(env.action_space.sample()),
+            "reward": jnp.array(0),
+            "next_state": jnp.array(env.observation_space.sample())
         }
         self.rb_env_state = self.replay_buffer_env.init(dummy_data)
         broadcast_fn = lambda x: jnp.broadcast_to(
@@ -372,6 +349,11 @@ class MBPOAgent:
 
         self.policy_configs = policy_configs
         self.policy = NetworkPolicy(policy_configs, rngs)
+        self.sac_policy = SAC(
+            policy="MlpPolicy",
+            env=env,
+            buffer_size=5000,
+        )
 
         self.model_configs = dynamics_configs
         self.model = EnsembleModels(dynamics_configs, rngs)
@@ -395,7 +377,7 @@ class MBPOAgent:
 
         self.shared_key, subkey = jax.random.split(self.shared_key)
         transition = sample_transition(mu, log_sigma, subkey)
-        next_state, reward = transition[:, :-1], transition[:, -1]
+        next_state, reward = transition[:-1], transition[-1]
         return next_state, reward
 
     def act(self, state):
@@ -477,35 +459,32 @@ def load_model_params(file_path: str):
 def evaluate_agent(agent, env, num_episodes=5):
     pass
 
-def plan_action(timestep, policy_fn):
+def plan_action(obs, policy_fn):
     """
     """
-    action = policy_fn(timestep.observation)
+    action = policy_fn(obs)
     return action
 
 if __name__ == "__main__":
     seed = 33
-    rng = jax.random.PRNGKey(seed)
-    env = make_env(rng)
-    time_step = env.reset()
-
-    state = time_step.observation
-    action_spec = env.action_spec()
+    env = make_env()
+    obs, _ = env.reset()
+    # rng = jax.random.PRNGKey(seed)
 
     # Configs
     dynamics_configs = DynamicsModelConfigs(
         learning_rate=1e-3,
         num_models=5,
         hidden_dim=64,
-        state_dim=get_observation_dim(env),
-        action_dim=action_spec.shape[0],
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.shape[0],
         nb_model_rollouts=100
     )
     policy_configs = PolicyConfigs(
         learning_rate=1e-3,
         hidden_dim=64,
-        state_dim=get_observation_dim(env),
-        action_dim=action_spec.shape[0],
+        state_dim=env.observation_space.shape[0],
+        action_dim=env.action_space.shape[0],
         nb_policy_updates=100
     )
     rb_configs = ReplayBufferConfigs(
@@ -526,9 +505,11 @@ if __name__ == "__main__":
         rb_configs,
         nnx.Rngs(seed)
     )
-    state = aggregate_state(state)
-    rnd_action = agent.act(state)
-    agent.simulate(state, rnd_action)
+    print(f"Agent initialized.")
+    rnd_action = agent.act(obs)
+    out, out1 = agent.simulate(obs, rnd_action)
+
+    env.close()
 
 # if __name__ == "__main__":
 
