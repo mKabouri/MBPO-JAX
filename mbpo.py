@@ -3,6 +3,7 @@ Reference:
 - Janner et al. (2019): "When to Trust Your Model: Model-Based Policy Optimization".
 https://arxiv.org/abs/1906.08253
 """
+import os
 import numpy as np
 import gymnasium as gym
 import jax
@@ -11,7 +12,7 @@ import flax
 import flax.nnx as nnx
 import flashbax as fbx
 import optax
-import functools
+import matplotlib.pyplot as plt
 
 # from stable_baselines3.sac import SAC
 from sbx import SAC
@@ -31,7 +32,6 @@ def make_env() -> gym.Env:
 class MBPOGeneralHyperparameters:
     num_epochs: int
     nb_steps_per_epoch: int
-    model_horizon: int
 
 @dataclass
 class ReplayBufferConfigs:
@@ -415,33 +415,34 @@ class MBPOAgent:
     def update_policy(self):
         """
         """
-        self.generate_model_rollouts()
         gradient_steps = self.policy_configs.num_rollouts*self.policy_configs.rollout_length
-
-        print("Attributes of the class:")
-        print(dir(SAC))
-        print("\nAttributes of the class instance:")
-        print(dir(self.sac_policy))
-
         self.sac_policy.train(
             gradient_steps=gradient_steps,
             batch_size=self.policy_configs.batch_size
         )
 
-    def train(self):
-        """
-        """
-        pass
-
-    def save(self, file_path: str):
-        """
-        """
-        pass
-
-    def load(self, file_path: str):
-        """
-        """
-        pass
+def evaluate_agent(
+    agent: MBPOAgent,
+    env: gym.Env,
+    num_episodes=5
+):
+    """
+    """
+    total_rewards = []
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        done = False
+        episode_reward = 0
+        while not done:
+            action = agent.act(state)
+            next_state, reward, done, _, _ = env.step(action)
+            episode_reward += reward
+            state = next_state
+        total_rewards.append(episode_reward)
+        print(f"Episode {episode + 1}/{num_episodes}: Total Reward = {episode_reward}")
+    avg_reward = sum(total_rewards)/num_episodes
+    print(f"Average Reward over {num_episodes} episodes: {avg_reward}")
+    return avg_reward
 
 def mbpo_loop(
     agent: MBPOAgent,
@@ -449,7 +450,44 @@ def mbpo_loop(
 ):
     """
     """
-    pass
+    env = agent.env
+    state, _ = env.reset()
+    rewards_per_epoch = []
+    for epoch in range(general_configs.num_epochs):
+        print(f"Epoch {epoch + 1}/{general_configs.num_epochs}")
+        agent.update_model()
+        total_reward = 0
+        for _ in range(general_configs.nb_steps_per_epoch):
+            action = agent.act(state)
+            next_state, reward, done, truncated, _ = env.step(jnp.array([action]))
+            total_reward += reward
+            env_data = {
+                "state": jnp.array(state),
+                "action": jnp.array([action]),
+                "reward": jnp.array(reward),
+                "next_state": jnp.array(next_state)
+            }
+            agent.rb_env_state = agent.replay_buffer_env.add(agent.rb_env_state, env_data)
+
+            agent.generate_model_rollouts()
+            agent.update_policy()
+
+            state = next_state
+
+        rewards_per_epoch.append(total_reward)
+        print(f"Total Reward for Epoch {epoch + 1}: {total_reward}")
+        if (epoch + 1) % general_configs.eval_interval == 0:
+            print("Evaluating agent...")
+            evaluate_agent(agent, env, num_episodes=5)
+    # Plot the rewards
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, general_configs.num_epochs + 1), rewards_per_epoch, label="Total Reward per Epoch")
+    plt.xlabel("Epochs")
+    plt.ylabel("Total Reward")
+    plt.title("Training Progress")
+    plt.legend()
+    plt.grid()
+    plt.show()
 
 def save_model_params(state: train_state.TrainState, file_path: str):
     """
@@ -465,15 +503,6 @@ def load_model_params(file_path: str):
     """
     params = np.load(file_path, allow_pickle=True)
     return params
-
-def evaluate_agent(agent, env, num_episodes=5):
-    pass
-
-def plan_action(obs, policy_fn):
-    """
-    """
-    action = policy_fn(obs)
-    return action
 
 if __name__ == "__main__":
     seed = 33
@@ -504,7 +533,10 @@ if __name__ == "__main__":
         max_length_time_axis=32,
         add_sequence_length=10
     )
-
+    general_configs = MBPOGeneralHyperparameters(
+        num_epochs=20,
+        nb_steps_per_epoch=1000
+    )
     # MBPO agent
     agent = MBPOAgent(
         env,
@@ -514,12 +546,7 @@ if __name__ == "__main__":
         nnx.Rngs(seed)
     )
     print(f"Agent initialized.")
-    rnd_action = agent.act(obs)
-    print(f"{obs = }")
-    print(f"{rnd_action = }")
-    out, out1 = agent.simulate(jnp.array(obs), jnp.array(rnd_action))
-    agent.update_model()
-    agent.update_policy()
 
+    mbpo_loop(agent, general_configs)
 
     env.close()
