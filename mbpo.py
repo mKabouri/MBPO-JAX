@@ -13,7 +13,8 @@ import flashbax as fbx
 import optax
 import functools
 
-from stable_baselines3.sac import SAC
+# from stable_baselines3.sac import SAC
+from sbx import SAC
 from flax.training import train_state
 from typing import Tuple, Dict
 from dataclasses import dataclass
@@ -53,11 +54,9 @@ class DynamicsModelConfigs:
 
 @dataclass
 class PolicyConfigs:
-    learning_rate: int
-    hidden_dim: int
-    state_dim: int
-    action_dim: int
-    nb_policy_updates: int
+    num_rollouts: int
+    rollout_length: int
+    batch_size: int
 
 class ModelNetwork(nnx.Module):
     """
@@ -345,7 +344,6 @@ class MBPOAgent:
         self.rb_model_state = self.replay_buffer_model.init(dummy_data)
 
         self.policy_configs = policy_configs
-        self.policy = NetworkPolicy(policy_configs, rngs)
         self.sac_policy = SAC(
             policy="MlpPolicy",
             env=env,
@@ -354,11 +352,6 @@ class MBPOAgent:
 
         self.model_configs = dynamics_configs
         self.model = EnsembleModels(dynamics_configs, rngs)
-
-        self.optimizer_policy = nnx.Optimizer(
-            self.policy,
-            optax.adam(learning_rate=policy_configs.learning_rate)
-        )
         self.optimizer_model = nnx.Optimizer(
             self.model,
             optax.adam(learning_rate=dynamics_configs.learning_rate)
@@ -380,40 +373,60 @@ class MBPOAgent:
     def act(self, state):
         """
         """
+        state = jnp.expand_dims(state, axis=0)
         self.shared_key, subkey = jax.random.split(self.shared_key)
-        _, action = self.policy.sample_action(state, subkey)
-        return action
+        action_distribution = self.sac_policy.actor.apply(
+            self.sac_policy.policy.actor_state.params,
+            state
+        )
+        action = action_distribution.sample(seed=subkey)
+        return action.squeeze()
 
     def update_model(self):
         """
+        TODO: when training check how sampling is done
         """
         self.shared_key, subkey = jax.random.split(self.shared_key)
         sample_data = self.replay_buffer_env.sample(self.rb_env_state, subkey)
         loss = loss_fn(self.model, sample_data)
         train_step(self.model, self.optimizer_model, loss, sample_data)
 
+    def generate_model_rollouts(self):
+        """
+        """
+        for _ in range(self.policy_configs.num_rollouts):
+            self.shared_key, subkey = jax.random.split(self.shared_key)
+            sampled_data = self.replay_buffer_env.sample(self.rb_env_state, subkey)
+            state = sampled_data.experience['state'][0]
+            for _ in range(self.policy_configs.rollout_length):
+                action = self.act(state)
+                next_state, reward = self.simulate(state[0], action)
+                done = False
+                self.sac_policy.replay_buffer.add(
+                    state[0],
+                    next_state,
+                    jnp.array([action]),
+                    jnp.array([reward]),
+                    done,
+                    [{}]
+                )
+                state = next_state
+
     def update_policy(self):
         """
-        NEED SAC
         """
-        pass
-        # # Sample data from the environment replay buffer
-        # samples = self.replay_buffer_env.sample(policy_configs.batch_size)
-        
-        # # Prepare the data for SAC training
-        # observations = samples["observations"]
-        # actions = samples["actions"]
-        # rewards = samples["rewards"]
-        # next_observations = samples["next_observations"]
+        self.generate_model_rollouts()
+        gradient_steps = self.policy_configs.num_rollouts*self.policy_configs.rollout_length
 
-        # # Update the SAC agent
-        # self.sac_policy.replay_buffer.add(
-        #     obs=observations,
-        #     action=actions,
-        #     reward=rewards,
-        #     next_obs=next_observations,
-        # )
-        # self.sac_policy.learn(total_timesteps=policy_configs.gradient_steps)
+        print("Attributes of the class:")
+        print(dir(SAC))
+        print("\nAttributes of the class instance:")
+        print(dir(self.sac_policy))
+
+        self.sac_policy.train(
+            gradient_steps=gradient_steps,
+            batch_size=self.policy_configs.batch_size
+        )
 
     def train(self):
         """
@@ -478,11 +491,9 @@ if __name__ == "__main__":
         nb_model_rollouts=100
     )
     policy_configs = PolicyConfigs(
-        learning_rate=1e-3,
-        hidden_dim=64,
-        state_dim=env.observation_space.shape[0],
-        action_dim=env.action_space.shape[0],
-        nb_policy_updates=100
+        num_rollouts=40,
+        rollout_length=1,
+        batch_size=10
     )
     rb_configs = ReplayBufferConfigs(
         add_batch_size=1,
@@ -504,28 +515,11 @@ if __name__ == "__main__":
     )
     print(f"Agent initialized.")
     rnd_action = agent.act(obs)
+    print(f"{obs = }")
+    print(f"{rnd_action = }")
     out, out1 = agent.simulate(jnp.array(obs), jnp.array(rnd_action))
     agent.update_model()
+    agent.update_policy()
+
 
     env.close()
-
-# if __name__ == "__main__":
-
-#     seed = 0
-#     key = jax.random.PRNGKey(seed)
-#     env = make_env(key)
-#     action_spec = env.action_spec()
-#     print(action_spec)
-#     timestep = env.reset()
-#     step_jit = jax.jit(env.step)
-
-#     while True:
-#         key, subkey = jax.random.split(key)
-#         rnd_action = jax.random.uniform(subkey, shape=action_spec.shape, minval=action_spec.minimum, maxval=action_spec.maximum)
-#         timestep = step_jit(rnd_action)
-#         pixels = env.physics.render(height=480, width=640)
-#         print(f"Reward: {timestep.reward}")
-
-#     # For evaluation
-#     # app = application.Application(title="DeepMind Control Suite Test")
-#     # app.launch(environment_loader=lambda: env, policy=random_policy)
