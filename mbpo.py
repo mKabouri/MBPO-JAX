@@ -471,14 +471,17 @@ def mbpo_loop(
 
             agent.generate_model_rollouts()
             agent.update_policy()
-
-            state = next_state
+            if done or truncated:
+                state, _ = env.reset()
+            else:
+                state = next_state
 
         rewards_per_epoch.append(total_reward)
         print(f"Total Reward for Epoch {epoch + 1}: {total_reward}")
         if (epoch + 1) % general_configs.eval_interval == 0:
             print("Evaluating agent...")
             evaluate_agent(agent, env, num_episodes=5)
+
     # Plot the rewards
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, general_configs.num_epochs + 1), rewards_per_epoch, label="Total Reward per Epoch")
