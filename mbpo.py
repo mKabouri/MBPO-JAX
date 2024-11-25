@@ -137,40 +137,32 @@ def sample_transition(
     return mu + sigma*jax.random.normal(rng, mu.shape)
 
 class EnsembleModels(nnx.Module):
+    """
+    """
     def __init__(
         self,
         configs: DynamicsModelConfigs,
         rngs: nnx.Rngs
     ) -> None:
-        super(EnsembleModels, self).__init__()
+        super().__init__()
         self.configs = configs
-        self.model1 = ModelNetwork(configs, rngs)
-        self.model2 = ModelNetwork(configs, rngs)
-        self.model3 = ModelNetwork(configs, rngs)
-        self.model4 = ModelNetwork(configs, rngs)
-        self.model5 = ModelNetwork(configs, rngs)
+        self.models = {
+            f"model{i+1}": ModelNetwork(configs, rngs) for i in range(configs.num_models)
+        }
 
     @property
     def get_models(self):
-        return self.models
+        return list(self.models.values())
 
     def __call__(
         self,
         inputs: Tuple[jnp.ndarray, jnp.ndarray],
     ) -> jax.Array:
         """
-        Apply each model in the ensemble to the same inputs.
         """
-        # state, action = inputs
-        # outputs = self._vmap_apply_model(self.models, jnp.array([state, action]))
-        # print(f"{outputs = }")
-        outputs = []
-        outputs.append(self.model1(inputs))
-        outputs.append(self.model2(inputs))
-        outputs.append(self.model3(inputs))
-        outputs.append(self.model4(inputs))
-        outputs.append(self.model5(inputs))
-        assert len(outputs) == self.configs.num_models
+        outputs = [
+            model(inputs) for model in self.get_models
+        ]
         return outputs
 
 def gaussian_nll(
@@ -516,7 +508,7 @@ if __name__ == "__main__":
     # Configs
     dynamics_configs = DynamicsModelConfigs(
         learning_rate=1e-3,
-        num_models=5,
+        num_models=6,
         hidden_dim=64,
         state_dim=env.observation_space.shape[0],
         action_dim=env.action_space.shape[0],
