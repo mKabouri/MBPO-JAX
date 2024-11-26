@@ -32,6 +32,7 @@ def make_env() -> gym.Env:
 class MBPOGeneralHyperparameters:
     num_epochs: int
     nb_steps_per_epoch: int
+    eval_interval: int
 
 @dataclass
 class ReplayBufferConfigs:
@@ -212,54 +213,6 @@ def train_step(
     loss, grads = grad_fn(model, batch)
     optimizer.update(grads)
 
-class NetworkPolicy(nnx.Module):
-    def __init__(
-        self,
-        configs: PolicyConfigs,
-        rngs: nnx.Rngs
-    ) -> None:
-        super(NetworkPolicy, self).__init__()
-        self.configs = configs
-        self.fc1 = nnx.Linear(
-            in_features=configs.state_dim,
-            out_features=configs.hidden_dim,
-            kernel_init=nnx.initializers.glorot_uniform(),
-            rngs=rngs
-        )
-        self.fc2 = nnx.Linear(
-            in_features=configs.hidden_dim,
-            out_features=configs.hidden_dim,
-            kernel_init=nnx.initializers.glorot_uniform(),
-            rngs=rngs
-        )
-        self.fc3 = nnx.Linear(
-            in_features=configs.hidden_dim,
-            out_features=configs.action_dim,
-            kernel_init=nnx.initializers.glorot_uniform(),
-            rngs=rngs
-        )
-
-    @property
-    def get_action_dim(self):
-        return self.fc3.out_features
-
-    def __call__(
-        self,
-        input: jax.Array
-    ) -> jax.Array:
-        output = nnx.relu(self.fc1(input))
-        output = nnx.relu(self.fc2(output))
-        output = nnx.softmax(self.fc3(output))
-        return output
-
-    def sample_action(
-        self,
-        input: jax.Array,
-        key
-    ):
-        key, subkey = jax.random.split(key)
-        return key, jax.random.categorical(subkey, self(input))
-
 def first_fill_env_replay_buffer(replay_buffer, rb_env_state, env: gym.Env):
     obs, _ = env.reset()
 
@@ -312,6 +265,7 @@ class MBPOAgent:
             "reward": jnp.array(0),
             "next_state": jnp.array(env.observation_space.sample())
         }
+        print(f"{dummy_data = }")
         self.rb_env_state = self.replay_buffer_env.init(dummy_data)
         broadcast_fn = lambda x: jnp.broadcast_to(
             x,
@@ -454,13 +408,15 @@ def mbpo_loop(
             next_state, reward, done, truncated, _ = env.step(jnp.array([action]))
             total_reward += reward
             env_data = {
-                "state": jnp.array(state),
-                "action": jnp.array([action]),
-                "reward": jnp.array(reward),
-                "next_state": jnp.array(next_state)
+                "state": jnp.expand_dims(jnp.expand_dims(state, axis=0), axis=1),
+                "action": jnp.expand_dims(jnp.expand_dims(action, axis=0), axis=1),
+                "reward": jnp.expand_dims(jnp.expand_dims(reward, axis=0), axis=1),
+                "next_state": jnp.expand_dims(jnp.expand_dims(next_state, axis=0), axis=1),
             }
-            agent.rb_env_state = agent.replay_buffer_env.add(agent.rb_env_state, env_data)
-
+            try:
+                agent.rb_env_state = agent.replay_buffer_env.add(agent.rb_env_state, env_data)
+            except Exception as e:
+                print(f"Error adding to buffer: {e}")
             agent.generate_model_rollouts()
             agent.update_policy()
             if done or truncated:
@@ -526,11 +482,12 @@ if __name__ == "__main__":
         period=1,
         min_length_time_axis=16,
         max_length_time_axis=32,
-        add_sequence_length=10
+        add_sequence_length=1
     )
     general_configs = MBPOGeneralHyperparameters(
         num_epochs=20,
-        nb_steps_per_epoch=1000
+        nb_steps_per_epoch=1000,
+        eval_interval=3
     )
     # MBPO agent
     agent = MBPOAgent(
